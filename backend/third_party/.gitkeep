@@ -1,0 +1,11 @@
+# This directory is intentionally empty in source control.
+#
+# Third-party libraries (Eigen, mbedTLS, nghttp2, nlohmann/json) are treated
+# as external dependencies. They are ignored by .gitignore and are fetched /
+# built on demand by the project build script:
+#
+#     python build_apk.py
+#
+# The script detects whether each library is present and, if missing, obtains
+# it via `git clone --depth 1 ...` (or other means) and runs a minimal compile
+# test to verify it.

@@ -1,0 +1,2 @@
+rootProject.name = 'gvio-android'
+include ':app'

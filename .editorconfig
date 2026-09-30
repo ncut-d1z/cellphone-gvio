@@ -1,0 +1,23 @@
+# EditorConfig helps developers define and maintain consistent
+# code styles between different editors and IDEs.
+# http://editorconfig.org
+
+root = true
+
+# Generic
+[*]
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+indent_style = space
+max_line_length = 80
+
+# Android Java module
+[android-app/src/main/java/com/gvio/app/**]
+max_line_length = 120
+
+# C++ backend
+[backend/src/**]
+max_line_length = 120

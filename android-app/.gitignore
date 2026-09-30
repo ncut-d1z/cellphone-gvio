@@ -1,0 +1,37 @@
+# Local configuration
+local.properties
+
+# Gradle files
+/.gradle/
+/build/
+
+# Android Studio
+.idea/
+*.iml
+
+# Generated files
+cpp/
+jni/
+
+# Keystore
+*.keystore
+
+# Proguard
+proguard/
+
+# Markdown export
+*.export
+
+# OS
+.DS_Store
+/AppleDouble
+/Icon
+
+# Vim
+*~
+
+# PHPStorm
+.idea/
+
+# editors
+.vscode/

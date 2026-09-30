@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+cmake-build/
+
+# Object files
+*.o
+*.lo
+*.tag
+
+# Libraries
+*.la
+*.lo
+
+# Profiling
+gmon.out
+
+# Editor temp
+*~
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+
+# CCache
+ccache/
+
+# Third party prebuilts (keep under version control if needed)
+# third_party/*/lib/
+# third_party/*/include/ - only if modified
+
+# Generated files

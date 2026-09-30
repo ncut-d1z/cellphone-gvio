@@ -1,0 +1,24 @@
+apply plugin: 'com.android.application'
+
+android {
+    compileSdkVersion 30
+    buildToolsVersion '30.0.3'
+
+    defaultConfig {
+        applicationId 'com.gvio.app'
+        minSdkVersion 30
+        targetSdkVersion 30
+        versionCode 1787509284
+        versionName '0.1.0'
+    }
+
+    compileOptions {
+        encoding 'UTF-8'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+}

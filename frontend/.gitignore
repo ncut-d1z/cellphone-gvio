@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+lib-cov/
+
+# NOTE: do not ignore js/lib/ — it contains vendored libraries
+# (three.min.js, OrbitControls.js) that are part of the source.
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Editor temp
+*~
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Package
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
