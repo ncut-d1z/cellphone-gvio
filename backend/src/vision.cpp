@@ -1,286 +1,129 @@
 #include "gvio/vision.h"
-
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
-
+#include <limits>
+#include <stdexcept>
 namespace gvio {
-
-void grayFromY(const uint8_t* y, int width, int height, int stride,
-               std::vector<uint8_t>& out) {
-    out.resize(static_cast<size_t>(width) * height);
-    for (int r = 0; r < height; ++r) {
-        std::memcpy(out.data() + static_cast<size_t>(r) * width,
-                    y + static_cast<size_t>(r) * stride,
-                    static_cast<size_t>(width));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FAST-9
-// ---------------------------------------------------------------------------
 namespace {
-
-// Bresenham 16 点圆(半径3), 坐标偏移
-const int kCircleDx[16] = {0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1};
-const int kCircleDy[16] = {-3, -3, -2, -1, 0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3};
-
-int fastCornerScore(const uint8_t* g, int stride, int x, int y, int threshold) {
-    const uint8_t center = g[y * stride + x];
-    const int lo = center - threshold;
-    const int hi = center + threshold;
-    int start = -1, n = 0;
-    // 找到最长的连续 9 段亮/暗
-    int best = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-        bool bright = (pass == 0);
-        for (int i = 0; i < 16; ++i) {
-            int idx = (start + i + 16) % 16;
-            const uint8_t v = g[(y + kCircleDy[idx]) * stride + (x + kCircleDx[idx])];
-            bool ok = bright ? (v >= hi) : (v <= lo);
-            if (ok) {
-                n++;
-                if (n > best) best = n;
-            } else {
-                if (start < 0) start = i;
-                if (n > best) best = n;
-                n = 0;
-            }
-        }
-    }
-    if (best < 9) return 0;
-    // 得分: 连续弧段与中心的绝对差之和
-    int score = 0;
-    for (int i = 0; i < 16; ++i) {
-        const uint8_t v = g[(y + kCircleDy[i]) * stride + (x + kCircleDx[i])];
-        int d = std::abs(int(v) - int(center));
-        score += d;
-    }
-    return score;
+bool dimensions(int w,int h) { return w>0 && h>0 && w<=16384 && h<=16384; }
+constexpr int cx[16]={0,1,2,3,3,3,2,1,0,-1,-2,-3,-3,-3,-2,-1};
+constexpr int cy[16]={-3,-3,-2,-1,0,1,2,3,3,3,2,1,0,-1,-2,-3};
+struct Level { int w,h; std::vector<float> pixels; };
+float sample(const Level& im,float x,float y) {
+    int ix=int(std::floor(x)),iy=int(std::floor(y)); float u=x-ix,v=y-iy;
+    return (1-v)*((1-u)*im.pixels[iy*im.w+ix]+u*im.pixels[iy*im.w+ix+1])+
+           v*((1-u)*im.pixels[(iy+1)*im.w+ix]+u*im.pixels[(iy+1)*im.w+ix+1]);
 }
-
-}  // namespace
-
-void detectFast(const uint8_t* gray, int width, int height, int threshold,
-                std::vector<Keypoint>& kps, int maxFeatures,
-                int cellsX, int cellsY, int maxPerCell) {
-    kps.clear();
-    if (width < 16 || height < 16 || maxFeatures <= 0) return;
-    const int margin = 4;
-
-    std::vector<Keypoint> all;
-    all.reserve(static_cast<size_t>(maxFeatures) * 2);
-
-    int cellW = (width - 2 * margin) / cellsX;
-    int cellH = (height - 2 * margin) / cellsY;
-    if (cellW < 8 || cellH < 8) return;
-
-    std::vector<std::vector<Keypoint>> cells(static_cast<size_t>(cellsX) * cellsY);
-
-    for (int cy = 0; cy < cellsY; ++cy) {
-        for (int cx = 0; cx < cellsX; ++cx) {
-            int x0 = margin + cx * cellW, x1 = margin + (cx + 1) * cellW;
-            int y0 = margin + cy * cellH, y1 = margin + (cy + 1) * cellH;
-            auto& cell = cells[static_cast<size_t>(cy) * cellsX + cx];
-            for (int y = y0; y < y1; ++y) {
-                for (int x = x0; x < x1; ++x) {
-                    const uint8_t c = gray[y * width + x];
-                    const int lo = c - threshold, hi = c + threshold;
-                    // 快速预检: 圆上 4 个点至少 3 个同时亮/暗
-                    const uint8_t p0 = gray[(y - 3) * width + x];
-                    const uint8_t p4 = gray[y * width + x + 3];
-                    const uint8_t p8 = gray[(y + 3) * width + x];
-                    const uint8_t p12 = gray[y * width + x - 3];
-                    int bright = (p0 >= hi) + (p4 >= hi) + (p8 >= hi) + (p12 >= hi);
-                    int dark = (p0 <= lo) + (p4 <= lo) + (p8 <= lo) + (p12 <= lo);
-                    if (bright < 3 && dark < 3) continue;
-                    int score = fastCornerScore(gray, width, x, y, threshold);
-                    if (score > 0) {
-                        Keypoint kp;
-                        kp.x = static_cast<float>(x);
-                        kp.y = static_cast<float>(y);
-                        kp.score = static_cast<float>(score);
-                        cell.push_back(kp);
-                    }
-                }
-            }
-            // 每格按得分取前 maxPerCell
-            std::sort(cell.begin(), cell.end(),
-                      [](const Keypoint& a, const Keypoint& b) { return a.score > b.score; });
-            if (static_cast<int>(cell.size()) > maxPerCell) cell.resize(maxPerCell);
-            for (auto& kp : cell) all.push_back(kp);
-        }
-    }
-
-    // 全局得分排序 + 非极大抑制(3x3)
-    std::sort(all.begin(), all.end(),
-              [](const Keypoint& a, const Keypoint& b) { return a.score > b.score; });
-
-    std::vector<uint8_t> occupied(static_cast<size_t>(width) * height, 0);
-    kps.reserve(static_cast<size_t>(maxFeatures));
-    for (auto& kp : all) {
-        int x = static_cast<int>(kp.x), y = static_cast<int>(kp.y);
-        if (occupied[static_cast<size_t>(y) * width + x]) continue;
-        kps.push_back(kp);
-        if (static_cast<int>(kps.size()) >= maxFeatures) break;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                int yy = y + dy, xx = x + dx;
-                if (xx >= 0 && xx < width && yy >= 0 && yy < height)
-                    occupied[static_cast<size_t>(yy) * width + xx] = 1;
-            }
-        }
-    }
+bool inside(const Level& im,float x,float y,int margin) {
+    return std::isfinite(x) && std::isfinite(y) && x>=margin && y>=margin &&
+           x<float(im.w-margin-1) && y<float(im.h-margin-1);
 }
-
-// ---------------------------------------------------------------------------
-// 金字塔 KLT
-// ---------------------------------------------------------------------------
-namespace {
-
-struct Pyramid {
-    std::vector<std::vector<uint8_t>> levels;
-    std::vector<int> widths, heights;
-    int nlevels;
-};
-
-void buildPyramid(const std::vector<uint8_t>& gray, int width, int height,
-                  Pyramid& pyr, int nlevels) {
-    pyr.nlevels = nlevels;
-    pyr.widths.resize(nlevels);
-    pyr.heights.resize(nlevels);
-    pyr.levels.resize(nlevels);
-    pyr.levels[0] = gray;
-    pyr.widths[0] = width;
-    pyr.heights[0] = height;
-    for (int l = 1; l < nlevels; ++l) {
-        int pw = pyr.widths[l - 1], ph = pyr.heights[l - 1];
-        int nw = (pw + 1) / 2, nh = (ph + 1) / 2;
-        pyr.widths[l] = nw;
-        pyr.heights[l] = nh;
-        pyr.levels[l].resize(static_cast<size_t>(nw) * nh);
-        const uint8_t* src = pyr.levels[l - 1].data();
-        uint8_t* dst = pyr.levels[l].data();
-        for (int y = 0; y < nh; ++y) {
-            for (int x = 0; x < nw; ++x) {
-                int sx = std::min(x * 2, pw - 1), sy = std::min(y * 2, ph - 1);
-                // 2x2 平均
-                int v = src[sy * pw + sx] + src[sy * pw + std::min(sx + 1, pw - 1)] +
-                        src[std::min(sy + 1, ph - 1) * pw + sx] +
-                        src[std::min(sy + 1, ph - 1) * pw + std::min(sx + 1, pw - 1)];
-                dst[y * nw + x] = static_cast<uint8_t>(v >> 2);
-            }
+std::vector<Level> pyramid(const std::vector<uint8_t>& data,int w,int h) {
+    std::vector<Level> p; p.push_back({w,h,std::vector<float>(data.begin(),data.end())});
+    constexpr int kernel[5]={1,4,6,4,1};
+    while (p.size()<3 && p.back().w>=40 && p.back().h>=40) {
+        const auto& a=p.back(); int nw=(a.w+1)/2,nh=(a.h+1)/2;
+        Level b{nw,nh,std::vector<float>(size_t(nw)*nh)};
+        for (int y=0;y<nh;++y) for (int x=0;x<nw;++x) {
+            float sum=0;
+            for (int j=-2;j<=2;++j) for (int i=-2;i<=2;++i)
+                sum+=kernel[i+2]*kernel[j+2]*a.pixels[std::clamp(2*y+j,0,a.h-1)*a.w+std::clamp(2*x+i,0,a.w-1)];
+            b.pixels[y*nw+x]=sum/256.f;
         }
+        p.push_back(std::move(b));
     }
+    return p;
 }
-
-inline uint8_t sampleBilinear(const uint8_t* img, int w, int h, float x, float y) {
-    int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
-    if (x0 < 0 || y0 < 0 || x0 >= w - 1 || y0 >= h - 1) return 0;
-    float dx = x - x0, dy = y - y0;
-    float v = img[y0 * w + x0] * (1 - dx) * (1 - dy) +
-              img[y0 * w + x0 + 1] * dx * (1 - dy) +
-              img[(y0 + 1) * w + x0] * (1 - dx) * dy +
-              img[(y0 + 1) * w + x0 + 1] * dx * dy;
-    return static_cast<uint8_t>(v + 0.5f);
+// Inverse-compositional LK: reference point NEVER moves with the target estimate.
+bool lk(const Level& a,const Level& b,float px,float py,float& qx,float& qy) {
+    constexpr int half=5,n=121;
+    if (!inside(a,px,py,half+1)) return false;
+    std::array<float,n> ref{},gx{},gy{}; int k=0;
+    double xx=0,xy=0,yy=0;
+    for (int j=-half;j<=half;++j) for (int i=-half;i<=half;++i,++k) {
+        ref[k]=sample(a,px+i,py+j);
+        gx[k]=.5f*(sample(a,px+i+1,py+j)-sample(a,px+i-1,py+j));
+        gy[k]=.5f*(sample(a,px+i,py+j+1)-sample(a,px+i,py+j-1));
+        xx+=gx[k]*gx[k]; xy+=gx[k]*gy[k]; yy+=gy[k]*gy[k];
+    }
+    double det=xx*yy-xy*xy;
+    double eig=.5*(xx+yy-std::hypot(xx-yy,2.*xy));
+    if (eig/n<1. || det<1e-9) return false;
+    bool converged=false;
+    for (int it=0;it<40;++it) {
+        if (!inside(b,qx,qy,half)) return false;
+        double ex=0,ey=0; k=0;
+        for (int j=-half;j<=half;++j) for (int i=-half;i<=half;++i,++k) {
+            double r=sample(b,qx+i,qy+j)-ref[k]; ex+=gx[k]*r; ey+=gy[k]*r;
+        }
+        double dx=-(yy*ex-xy*ey)/det,dy=-(xx*ey-xy*ex)/det;
+        if (!std::isfinite(dx) || !std::isfinite(dy) || std::abs(dx)>10. || std::abs(dy)>10.) return false;
+        qx+=float(dx); qy+=float(dy);
+        if (dx*dx+dy*dy<1e-4) { converged=true; break; }
+    }
+    if (!converged || !inside(b,qx,qy,half)) return false;
+    double err=0; k=0;
+    for (int j=-half;j<=half;++j) for (int i=-half;i<=half;++i,++k) {
+        double r=sample(b,qx+i,qy+j)-ref[k]; err+=r*r;
+    }
+    return err/n<30.*30.;
 }
-
-bool lkIterate(const uint8_t* prev, const uint8_t* cur, int w, int h,
-               float& ux, float& uy, int halfWin, float maxDisp) {
-    const int win = 2 * halfWin + 1;
-    // 预计算上一帧窗口梯度(需要 ±1 邻域)
-    float gxx = 0, gyy = 0, gxy = 0;
-    int x0 = static_cast<int>(ux), y0 = static_cast<int>(uy);
-    if (x0 - halfWin - 1 < 0 || y0 - halfWin - 1 < 0 || x0 + halfWin + 1 >= w ||
-        y0 + halfWin + 1 >= h)
-        return false;
-    for (int dy = -halfWin; dy <= halfWin; ++dy) {
-        const uint8_t* row = prev + (y0 + dy) * w + (x0 - halfWin);
-        for (int dx = -halfWin; dx <= halfWin; ++dx) {
-            int ix = row[dx + 1] - row[dx - 1];
-            int iy = row[dx + w] - row[dx - w];
-            gxx += static_cast<float>(ix * ix);
-            gyy += static_cast<float>(iy * iy);
-            gxy += static_cast<float>(ix * iy);
-        }
+bool trackOne(const std::vector<Level>& a,const std::vector<Level>& b,float px,float py,float& qx,float& qy) {
+    int top=int(a.size())-1;
+    while (top>0 && !inside(a[top],px/float(1<<top),py/float(1<<top),6)) --top;
+    qx=px/float(1<<top); qy=py/float(1<<top);
+    for (int l=top;l>=0;--l) {
+        if (l<top) { qx*=2; qy*=2; } // upscale target ONCE between levels
+        float scale=float(1<<l);
+        if (!lk(a[l],b[l],px/scale,py/scale,qx,qy)) return false;
     }
-    float det = gxx * gyy - gxy * gxy;
-    if (det < 1e-6f) return false;
-    det = 1.0f / det;
-
-    float dx = 0, dy = 0;
-    for (int iter = 0; iter < 30; ++iter) {
-        float ex = 0, ey = 0;
-        float bx = ux + dx, by = uy + dy;
-        int bx0 = static_cast<int>(bx), by0 = static_cast<int>(by);
-        if (bx0 - halfWin < 0 || by0 - halfWin < 0 ||
-            bx0 + halfWin >= w || by0 + halfWin >= h)
-            return false;
-        // 迭代中 prev 梯度取自固定窗口(x0,y0), 边界检查已包含 ±1
-        if (x0 + halfWin + 1 >= w || y0 + halfWin + 1 >= h) return false;
-        for (int j = -halfWin; j <= halfWin; ++j) {
-            for (int i = -halfWin; i <= halfWin; ++i) {
-                float it = sampleBilinear(cur, w, h, bx + i, by + j);
-                float ip = prev[(y0 + j) * w + (x0 + i)];
-                ex += (it - ip) * static_cast<float>(prev[(y0 + j) * w + (x0 + i + 1)] -
-                                                     prev[(y0 + j) * w + (x0 + i - 1)]);
-                ey += (it - ip) * static_cast<float>(prev[(y0 + j + 1) * w + (x0 + i)] -
-                                                     prev[(y0 + j - 1) * w + (x0 + i)]);
-            }
-        }
-        float nx = (gyy * ex - gxy * ey) * det;
-        float ny = (gxx * ey - gxy * ex) * det;
-        dx += nx;
-        dy += ny;
-        if (nx * nx + ny * ny < 0.01f * 0.01f) break;
-    }
-    if (std::abs(dx) > maxDisp || std::abs(dy) > maxDisp) return false;
-    ux += dx;
-    uy += dy;
     return true;
 }
-
-}  // namespace
-
-int trackKlt(const std::vector<uint8_t>& grayPrev, const std::vector<uint8_t>& grayCur,
-             int width, int height, const std::vector<Keypoint>& ptsIn,
-             std::vector<Keypoint>& ptsOut, std::vector<uint8_t>& status) {
-    const int nlevels = 3;
-    Pyramid pa, pb;
-    buildPyramid(grayPrev, width, height, pa, nlevels);
-    buildPyramid(grayCur, width, height, pb, nlevels);
-
-    ptsOut.resize(ptsIn.size());
-    status.assign(ptsIn.size(), 0);
-
-    int nOk = 0;
-    for (size_t i = 0; i < ptsIn.size(); ++i) {
-        float x = ptsIn[i].x, y = ptsIn[i].y;
-        bool ok = true;
-        for (int l = nlevels - 1; l >= 0; --l) {
-            float sx = x / static_cast<float>(1 << l);
-            float sy = y / static_cast<float>(1 << l);
-            float maxDisp = (l > 0) ? 30.0f : 3.0f;  // 粗层允许较大位移
-            if (!lkIterate(pa.levels[l].data(), pb.levels[l].data(),
-                           pa.widths[l], pa.heights[l], sx, sy, 7, maxDisp)) {
-                ok = false;
-                break;
-            }
-            if (l > 0) { sx *= 2; sy *= 2; }  // 下一层初始位置
-            x = sx;
-            y = sy;
-        }
-        if (ok && x > 2 && y > 2 && x < width - 3 && y < height - 3) {
-            Keypoint kp;
-            kp.x = x;
-            kp.y = y;
-            kp.score = ptsIn[i].score;
-            ptsOut[i] = kp;
-            status[i] = 1;
-            nOk++;
-        }
-    }
-    return nOk;
 }
-
-}  // namespace gvio
+void grayFromY(const uint8_t* y,int w,int h,int stride,std::vector<uint8_t>& out) {
+    if (!y || !dimensions(w,h) || stride<w) throw std::invalid_argument("invalid Y plane layout");
+    out.resize(size_t(w)*h);
+    for (int r=0;r<h;++r) std::memcpy(out.data()+size_t(r)*w,y+size_t(r)*stride,size_t(w));
+}
+void detectFast(const uint8_t* gray,int w,int h,int threshold,std::vector<Keypoint>& out,
+                int maxFeatures,int nx,int ny,int maxPerCell) {
+    out.clear();
+    if (!gray || !dimensions(w,h) || w<9 || h<9 || nx<1 || ny<1 || nx>256 || ny>256 ||
+        threshold<1 || threshold>255 || maxFeatures<1 || maxPerCell<1) return;
+    std::vector<Keypoint> candidates;
+    for (int y=3;y<h-3;++y) for (int x=3;x<w-3;++x) {
+        int d[16],score=0,center=gray[y*w+x];
+        for (int i=0;i<16;++i) d[i]=int(gray[(y+cy[i])*w+x+cx[i]])-center;
+        for (int sign:{-1,1}) for (int start=0;start<16;++start) {
+            int arc=256;
+            for (int j=0;j<9;++j) { arc=std::min(arc,sign*d[(start+j)%16]); if (arc<=threshold) break; }
+            score=std::max(score,arc);
+        }
+        if (score>threshold) candidates.push_back({float(x),float(y),float(score)});
+    }
+    std::stable_sort(candidates.begin(),candidates.end(),[](const Keypoint& a,const Keypoint& b){return a.score>b.score;});
+    std::vector<uint8_t> used(size_t(w)*h,0); std::vector<int> count(size_t(nx)*ny,0);
+    for (const auto& p:candidates) {
+        int x=int(p.x),y=int(p.y),cell=std::min(ny-1,y*ny/h)*nx+std::min(nx-1,x*nx/w);
+        if (used[y*w+x] || count[cell]>=maxPerCell) continue;
+        out.push_back(p); ++count[cell];
+        if (out.size()>=size_t(maxFeatures)) break;
+        for (int j=-1;j<=1;++j) for (int i=-1;i<=1;++i) used[(y+j)*w+x+i]=1;
+    }
+}
+int trackKlt(const std::vector<uint8_t>& prev,const std::vector<uint8_t>& cur,int w,int h,
+             const std::vector<Keypoint>& input,std::vector<Keypoint>& output,std::vector<uint8_t>& status) {
+    output=input; status.assign(input.size(),0);
+    if (!dimensions(w,h) || prev.size()!=size_t(w)*h || cur.size()!=size_t(w)*h) return 0;
+    auto a=pyramid(prev,w,h),b=pyramid(cur,w,h); int count=0;
+    for (size_t i=0;i<input.size();++i) {
+        float x=0,y=0,backX=0,backY=0;
+        if (!trackOne(a,b,input[i].x,input[i].y,x,y) || !trackOne(b,a,x,y,backX,backY)) continue;
+        if (std::hypot(backX-input[i].x,backY-input[i].y)>.75f) continue;
+        output[i]={x,y,input[i].score}; status[i]=1; ++count;
+    }
+    return count;
+}
+} // namespace gvio

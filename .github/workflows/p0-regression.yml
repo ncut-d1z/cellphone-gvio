@@ -1,0 +1,69 @@
+name: P0 regression
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: p0-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CC: clang
+      CXX: clang++
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build libeigen3-dev nlohmann-json3-dev libmbedtls-dev libnghttp2-dev
+          python -m pip install 'httpx[http2]==0.28.1'
+      - name: Private-key guard and its regression tests
+        run: |
+          python tools/check_no_private_keys.py
+          python tools/test_private_key_guard.py
+      - name: Configure
+        run: cmake -S backend -B backend/build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS_DEBUG='-O0 -g0' -DGVIO_WITH_SERVER=ON -DGVIO_SANITIZE=ON -DGVIO_BUILD_TOOLS=ON
+      - name: Build
+        run: cmake --build backend/build --parallel 2
+      - name: Core, engine and real TLS integration
+        run: ctest --test-dir backend/build --output-on-failure
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Header-only dependencies
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install eigen3:x64-windows nlohmann-json:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Configure
+        shell: pwsh
+        run: cmake -S backend -B backend/build -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DGVIO_WITH_SERVER=OFF -DGVIO_BUILD_TOOLS=ON
+      - name: Build and test
+        shell: pwsh
+        run: |
+          cmake --build backend/build --config Debug --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir backend/build -C Debug --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows PowerShell 5.1 key generator
+        shell: powershell
+        run: .\tools\test_private_key_generator.ps1
+      - name: Private-key guard
+        run: |
+          python tools/check_no_private_keys.py
+          python tools/test_private_key_guard.py

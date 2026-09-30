@@ -1,0 +1,6 @@
+#!/bin/sh
+# Enable locally with: git config core.hooksPath .githooks
+# CI checks the index independently; hooks can still be bypassed with --no-verify.
+root=$(git rev-parse --show-toplevel) || exit 2
+cd "$root" || exit 2
+exec python tools/check_no_private_keys.py

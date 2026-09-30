@@ -1,85 +1,101 @@
-cmake_minimum_required(VERSION 3.10)
-project(gvio_fusion C CXX)
-
+cmake_minimum_required(VERSION 3.16)
+project(gvio_fusion LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_CXX_EXTENSIONS OFF)
+option(GVIO_ANDROID "Build JNI adapter" OFF)
+option(GVIO_BUILD_TOOLS "Build synthetic desktop tools" OFF)
+option(GVIO_WITH_SERVER "Build optional HTTP/2 TLS service" OFF)
+option(GVIO_CORE_ONLY "Build math/vision/timeline without JSON or networking" OFF)
+option(GVIO_SANITIZE "Enable address and undefined-behavior sanitizers" OFF)
+include(CTest)
+find_package(Threads REQUIRED)
+find_package(Eigen3 3.3 QUIET NO_MODULE)
+if(NOT TARGET Eigen3::Eigen)
+  # Legacy dependency installer used a lowercase eigen directory. Normalize only
+  # into the build tree; never modify installed third-party sources.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/eigen/Core")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/eigen/" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/eigen-compat/Eigen")
+  endif()
+  find_path(EIGEN3_INCLUDE_DIR Eigen/Core HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party" "${CMAKE_CURRENT_BINARY_DIR}/eigen-compat" PATH_SUFFIXES eigen3)
+  if(NOT EIGEN3_INCLUDE_DIR)
+    message(FATAL_ERROR "Eigen3 not found. Install eigen3 with your package manager or set EIGEN3_INCLUDE_DIR.")
+  endif()
+  add_library(Eigen3::Eigen INTERFACE IMPORTED)
+  set_target_properties(Eigen3::Eigen PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${EIGEN3_INCLUDE_DIR}")
 endif()
-
-option(GVIO_ANDROID "Build for Android (JNI)" OFF)
-option(GVIO_BUILD_TOOLS "Build desktop tools/tests" OFF)
-
-set(GVIO_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-
-include_directories(
-  ${GVIO_ROOT}/include
-  ${GVIO_ROOT}/third_party
-  ${GVIO_ROOT}/third_party/nghttp2/includes
-  ${GVIO_ROOT}/third_party/mbedtls/include
-)
-
-# ---------------------------------------------------------------------------
-# nghttp2 (static, C)
-# ---------------------------------------------------------------------------
-file(GLOB NGHTTP2_SRC ${GVIO_ROOT}/third_party/nghttp2/*.c)
-add_library(nghttp2 STATIC ${NGHTTP2_SRC})
-target_include_directories(nghttp2 PUBLIC ${GVIO_ROOT}/third_party/nghttp2/includes)
-target_compile_definitions(nghttp2 PUBLIC NGHTTP2_STATICLIB)
-target_compile_options(nghttp2 PRIVATE -w)
-
-# ---------------------------------------------------------------------------
-# mbedtls (static, C)
-# ---------------------------------------------------------------------------
-file(GLOB MBEDTLS_SRC ${GVIO_ROOT}/third_party/mbedtls/library/*.c)
-add_library(mbedtls STATIC ${MBEDTLS_SRC})
-target_include_directories(mbedtls PUBLIC ${GVIO_ROOT}/third_party/mbedtls/include)
-target_compile_options(mbedtls PRIVATE -w)
-
-# ---------------------------------------------------------------------------
-# gvio 后端本体
-# ---------------------------------------------------------------------------
-set(GVIO_SRC
-  ${GVIO_ROOT}/src/config.cpp
-  ${GVIO_ROOT}/src/vision.cpp
-  ${GVIO_ROOT}/src/msckf.cpp
-  ${GVIO_ROOT}/src/fusion.cpp
-  ${GVIO_ROOT}/src/server/server.cpp
-  ${GVIO_ROOT}/src/server/handler.cpp
-)
-
-add_library(gvio_fusion STATIC ${GVIO_SRC})
-target_link_libraries(gvio_fusion PUBLIC nghttp2 mbedtls)
-if(WIN32)
-  target_link_libraries(gvio_fusion PUBLIC ws2_32 bcrypt)
+add_library(gvio_core STATIC src/msckf.cpp src/vision.cpp)
+target_include_directories(gvio_core PUBLIC include)
+target_link_libraries(gvio_core PUBLIC Eigen3::Eigen)
+target_compile_definitions(gvio_core PUBLIC _USE_MATH_DEFINES)
+set_target_properties(gvio_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(GVIO_SANITIZE AND NOT MSVC)
+  target_compile_options(gvio_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(gvio_core PUBLIC -fsanitize=address,undefined)
 endif()
-
-# ---------------------------------------------------------------------------
-# JNI 层(仅 Android)
-# ---------------------------------------------------------------------------
+if(BUILD_TESTING)
+  add_executable(gvio_core_regression tests/core_regression.cpp)
+  target_link_libraries(gvio_core_regression PRIVATE gvio_core)
+  foreach(case propagation jacobians tracks timeline vision)
+    add_test(NAME "core_${case}" COMMAND gvio_core_regression "${case}")
+    set_tests_properties("core_${case}" PROPERTIES TIMEOUT 60)
+  endforeach()
+endif()
+if(GVIO_CORE_ONLY)
+  return()
+endif()
+find_package(nlohmann_json 3.2 QUIET CONFIG)
+if(NOT TARGET nlohmann_json::nlohmann_json)
+  find_path(JSON_INCLUDE_DIR nlohmann/json.hpp HINTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+  if(NOT JSON_INCLUDE_DIR)
+    message(FATAL_ERROR "nlohmann/json not found. Install nlohmann-json or set JSON_INCLUDE_DIR.")
+  endif()
+  add_library(nlohmann_json::nlohmann_json INTERFACE IMPORTED)
+  set_target_properties(nlohmann_json::nlohmann_json PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${JSON_INCLUDE_DIR}")
+endif()
+add_library(gvio_fusion STATIC src/config.cpp src/fusion.cpp src/server/server.cpp src/server/handler.cpp)
+target_link_libraries(gvio_fusion PUBLIC gvio_core nlohmann_json::nlohmann_json Threads::Threads)
+target_compile_definitions(gvio_fusion PRIVATE GVIO_WITH_SERVER=$<BOOL:${GVIO_WITH_SERVER}>)
+set_target_properties(gvio_fusion PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(GVIO_WITH_SERVER)
+  find_path(MBEDTLS_INCLUDE_DIR mbedtls/ssl.h)
+  find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h)
+  find_library(MBEDTLS_LIBRARY NAMES mbedtls)
+  find_library(MBEDX509_LIBRARY NAMES mbedx509)
+  find_library(MBEDCRYPTO_LIBRARY NAMES mbedcrypto)
+  find_library(NGHTTP2_LIBRARY NAMES nghttp2 nghttp2_static)
+  foreach(dep MBEDTLS_INCLUDE_DIR NGHTTP2_INCLUDE_DIR MBEDTLS_LIBRARY MBEDX509_LIBRARY MBEDCRYPTO_LIBRARY NGHTTP2_LIBRARY)
+    if(NOT ${dep})
+      message(FATAL_ERROR "${dep} missing: install mbedTLS and nghttp2 development packages, or disable GVIO_WITH_SERVER.")
+    endif()
+  endforeach()
+  target_include_directories(gvio_fusion PRIVATE "${MBEDTLS_INCLUDE_DIR}" "${NGHTTP2_INCLUDE_DIR}")
+  target_link_libraries(gvio_fusion PRIVATE "${MBEDTLS_LIBRARY}" "${MBEDX509_LIBRARY}" "${MBEDCRYPTO_LIBRARY}" "${NGHTTP2_LIBRARY}")
+  if(WIN32)
+    target_link_libraries(gvio_fusion PRIVATE ws2_32 bcrypt)
+  endif()
+endif()
 if(GVIO_ANDROID)
-  add_library(gvio_jni SHARED ${GVIO_ROOT}/src/jni/gvio_jni.cpp)
-  target_link_libraries(gvio_jni PRIVATE gvio_fusion)
+  add_library(gvio_jni SHARED src/jni/gvio_jni.cpp)
+  target_link_libraries(gvio_jni PRIVATE gvio_fusion log)
   set_target_properties(gvio_jni PROPERTIES OUTPUT_NAME gvio_fusion)
-  target_link_libraries(gvio_jni PRIVATE log)
-  find_library(LOG_LIB log)
 endif()
-
-# ---------------------------------------------------------------------------
-# 桌面工具(验证/测试)
-# ---------------------------------------------------------------------------
 if(GVIO_BUILD_TOOLS)
-  add_executable(gvio_desktop
-    ${GVIO_ROOT}/src/tools/main_desktop.cpp
-    ${GVIO_ROOT}/src/tools/synthetic.cpp
-  )
+  add_executable(gvio_desktop src/tools/main_desktop.cpp src/tools/synthetic.cpp)
+  add_executable(gvio_isolate src/tools/test_isolate.cpp src/tools/synthetic.cpp)
   target_link_libraries(gvio_desktop PRIVATE gvio_fusion)
-  target_compile_definitions(gvio_desktop PRIVATE GVIO_TOOL=1)
-
-  add_executable(gvio_isolate
-    ${GVIO_ROOT}/src/tools/test_isolate.cpp
-    ${GVIO_ROOT}/src/tools/synthetic.cpp
-  )
   target_link_libraries(gvio_isolate PRIVATE gvio_fusion)
-  target_compile_definitions(gvio_isolate PRIVATE GVIO_TOOL=1)
+endif()
+if(BUILD_TESTING)
+  add_executable(gvio_engine_regression tests/engine_regression.cpp)
+  target_link_libraries(gvio_engine_regression PRIVATE gvio_fusion)
+  add_test(NAME engine_lifecycle COMMAND gvio_engine_regression)
+  set_tests_properties(engine_lifecycle PROPERTIES TIMEOUT 60)
+  if(GVIO_WITH_SERVER)
+    add_executable(gvio_server_probe tests/server_probe.cpp)
+    target_link_libraries(gvio_server_probe PRIVATE gvio_fusion)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME tls_h2_sse COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_server.py" $<TARGET_FILE:gvio_server_probe>)
+    set_tests_properties(tls_h2_sse PROPERTIES TIMEOUT 90)
+  endif()
 endif()

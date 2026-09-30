@@ -1,575 +1,263 @@
 #include "gvio/fusion.h"
-
 #include "gvio/server.h"
-
+#include <algorithm>
 #include <cmath>
-
+#include <limits>
+#include <stdexcept>
 namespace gvio {
-
 namespace {
-const double kA = 6378137.0;
-const double kF = 1.0 / 298.257223563;
-const double kE2 = kF * (2.0 - kF);
-const double kInitAccelCount = 80;   // ~0.4s @ 200Hz
-const double kInitMagCount = 3;
-const int kMaxGpsPath = 800;
-}  // namespace
-
-FusionEngine::FusionEngine(const Config& cfg)
-    : cfg_(cfg), filter_(cfg.filter), running_(false) {
-    server_ = nullptr;
+Vec3 ecef(double lat,double lon,double alt) {
+    constexpr double a=6378137.,f=1./298.257223563,e2=f*(2.-f);
+    double phi=lat*kPi/180.,lam=lon*kPi/180.,N=a/std::sqrt(1.-e2*std::sin(phi)*std::sin(phi));
+    return {(N+alt)*std::cos(phi)*std::cos(lam),(N+alt)*std::cos(phi)*std::sin(lam),(N*(1.-e2)+alt)*std::sin(phi)};
 }
-
-FusionEngine::~FusionEngine() {
-    stop();
 }
-
-// ---------------------------------------------------------------------------
-// 启动/停止
-// ---------------------------------------------------------------------------
+FusionEngine::FusionEngine(const Config& cfg):cfg_(cfg),filter_(cfg.filter),timeline_(cfg.filter.reorderWindowNs) {}
+FusionEngine::~FusionEngine() { stop(); }
 bool FusionEngine::start() {
-    if (running_.load()) return true;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        stop_ = false;
-    }
-    running_ = true;
-    thread_ = std::thread(&FusionEngine::loop, this);
-
-    // HTTP/2 服务器
+    std::lock_guard<std::mutex> life(lifecycleMtx_);
+    if (running_) return true;
+    if (thread_.joinable()) thread_.join();
+    { std::lock_guard<std::mutex> lk(mtx_); stop_=false; pending_.clear(); commands_.clear(); }
+    clearState(); paused_=false; error_.clear();
     try {
-        auto& f = cfg_.filter;
-        server_ = new Http2Server(f.serverHost, f.serverPort, f.certPath, f.keyPath,
-                                  f.webRoot);
-        server_->setStatusFn([this]() { return statusJson(); });
-        server_->setControlFn([this](const std::string& body) {
-            std::string resp;
-            try {
-                Json j = Json::parse(body);
-                std::string cmd = j.value("cmd", "");
-                if (cmd == "start") {
-                    resp = "{\"ok\":true,\"msg\":\"already running\"}";
-                } else if (cmd == "stop") {
-                    stop();
-                    resp = "{\"ok\":true,\"msg\":\"stopping\"}";
-                } else if (cmd == "reset") {
-                    reset();
-                    resp = "{\"ok\":true,\"msg\":\"reset\"}";
-                } else if (cmd == "magcal") {
-                    startMagCal();
-                    resp = "{\"ok\":true,\"msg\":\"mag calibrating, 旋转手机\"}";
-                } else {
-                    resp = "{\"ok\":false,\"msg\":\"unknown cmd\"}";
-                }
-            } catch (...) {
-                resp = "{\"ok\":false,\"msg\":\"bad json\"}";
-            }
-            return resp;
-        });
-        server_->start();
-    } catch (const std::exception& e) {
-        delete server_;
-        server_ = nullptr;
-        stop();
-        return false;
+        if (cfg_.filter.serverEnabled) {
+            auto& f=cfg_.filter;
+            server_=std::make_unique<Http2Server>(f.serverHost,f.serverPort,f.certPath,f.keyPath,f.webRoot);
+            server_->setStatusFn([this]{return statusJson();});
+            server_->setControlFn([this](const std::string& body) {
+                try {
+                    std::string cmd=Json::parse(body).value("cmd","");
+                    if (cmd=="stop") command(Command::Pause);
+                    else if (cmd=="start") command(Command::Resume);
+                    else if (cmd=="reset") command(Command::Reset);
+                    else if (cmd=="magcal") command(Command::MagCal);
+                    else return std::string("{\"ok\":false,\"msg\":\"unknown command\"}");
+                    return std::string("{\"ok\":true,\"msg\":\"queued\"}");
+                } catch (const std::exception&) { return std::string("{\"ok\":false,\"msg\":\"bad command\"}"); }
+            });
+            if (!server_->start()) { server_.reset(); return false; }
+        }
+        running_=true;
+        thread_=std::thread(&FusionEngine::loop,this);
+    } catch (const std::exception&) {
+        running_=false; if (server_) server_->stop(); server_.reset(); return false;
     }
     return true;
 }
-
 void FusionEngine::stop() {
-    running_ = false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        stop_ = true;
-    }
+    std::lock_guard<std::mutex> life(lifecycleMtx_);
+    { std::lock_guard<std::mutex> lk(mtx_); stop_=true; }
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
-    if (server_) {
-        server_->stop();
-        delete server_;
-        server_ = nullptr;
-    }
+    if (server_) { server_->stop(); server_.reset(); }
+    running_=false;
 }
-
-void FusionEngine::reset() {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        imuQ_.clear();
-        magQ_.clear();
-        gpsQ_.clear();
-        satsQ_.clear();
-        imgQ_.clear();
-        resetPending_ = true;
-    }
-    cv_.notify_all();
+void FusionEngine::command(Command cmd) {
+    { std::lock_guard<std::mutex> lk(mtx_);
+      if (commands_.size()<32) commands_.push_back(cmd); else ++admissionDrops_; }
+    cv_.notify_one();
 }
-
-void FusionEngine::startMagCal() {
+void FusionEngine::reset() { command(Command::Reset); }
+void FusionEngine::startMagCal() { command(Command::MagCal); }
+void FusionEngine::setClockOffset(double ns) {
+    if (!std::isfinite(ns) || std::abs(ns)>9e18) throw std::invalid_argument("invalid clock offset");
     std::lock_guard<std::mutex> lk(mtx_);
-    magCal_.start();
+    int64_t value=static_cast<int64_t>(ns);
+    if (running_ && hasClockOffset_ && value!=clockOffsetNs_)
+        throw std::logic_error("stop acquisition before changing clock domain");
+    clockOffsetNs_=value; hasClockOffset_=true;
 }
-
-void FusionEngine::setClockOffset(double offsetNs) {
-    clockOffsetNs_ = offsetNs;
-    hasClockOffset_.store(true);
-}
-
-bool FusionEngine::clockOffsetReady() const {
-    return hasClockOffset_.load();
-}
-
-// ---------------------------------------------------------------------------
-// 采集侧入队
-// ---------------------------------------------------------------------------
-void FusionEngine::feedImu(int64_t tNs, const float* values, const float* biases) {
-    ImuSample s;
-    s.t = tNs;
-    s.gyro = Vec3(values[3], values[4], values[5]);
-    s.accel = Vec3(values[0], values[1], values[2]);
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        imuQ_.push_back(s);
-    }
+void FusionEngine::enqueue(Pending p) {
+    { std::lock_guard<std::mutex> lk(mtx_);
+      if (stop_ || !running_ || pending_.size()>=8192) { ++admissionDrops_; return; }
+      pending_.push_back(std::move(p)); }
     cv_.notify_one();
 }
-
-void FusionEngine::feedMag(int64_t tNs, const float* values, const float* biases) {
-    MagSample s;
-    s.t = tNs;
-    s.value = Vec3(values[0], values[1], values[2]);
-    s.bias = Vec3(biases[0], biases[1], biases[2]);
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        magQ_.push_back(s);
-    }
-    cv_.notify_one();
+void FusionEngine::feedImu(int64_t t,const float* v,const float*) {
+    if (!v) { ++admissionDrops_; return; }
+    Pending p; p.imu=true; p.sample.t=t; p.sample.accel=Vec3(v[0],v[1],v[2]); p.sample.gyro=Vec3(v[3],v[4],v[5]);
+    enqueue(std::move(p));
 }
-
-void FusionEngine::feedGpsFix(int64_t tNs, double lat, double lon, double alt,
-                              float accH, float speed, float bearing) {
-    GpsFix f;
-    f.t = tNs;
-    f.lat = lat;
-    f.lon = lon;
-    f.alt = alt;
-    f.sigma = accH > 0.5 ? accH : 10.0;
-    f.speed = speed;
-    f.bearing = bearing;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        gpsQ_.push_back(f);
-    }
-    cv_.notify_one();
+void FusionEngine::feedMag(int64_t t,const float* v,const float* bias) {
+    if (!v || !bias) { ++admissionDrops_; return; }
+    MagSample s; s.t=t; s.value=Vec3(v[0],v[1],v[2]); s.bias=Vec3(bias[0],bias[1],bias[2]);
+    Pending p; p.t=t; p.priority=10; p.apply=[this,s]{processMag(s);}; enqueue(std::move(p));
 }
-
-void FusionEngine::feedGnssSats(int64_t tNs, const int* constellations,
-                                const float* cn0, int n) {
-    GnssSats s;
-    s.t = tNs;
-    s.constellations.assign(constellations, constellations + n);
-    s.cn0.assign(cn0, cn0 + n);
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        satsQ_.push_back(s);
-    }
+void FusionEngine::feedGpsFix(int64_t t,double lat,double lon,double alt,float accuracy,float speed,float bearing) {
+    if (!std::isfinite(lat) || !std::isfinite(lon) || !std::isfinite(alt) || std::abs(lat)>90. ||
+        std::abs(lon)>180. || !std::isfinite(accuracy) || accuracy<=0.) { ++admissionDrops_; return; }
+    GpsFix f; f.t=t; f.lat=lat; f.lon=lon; f.alt=alt; f.sigma=accuracy; f.speed=speed; f.bearing=bearing;
+    Pending p; p.t=t; p.priority=20; p.apply=[this,f]{processGps(f);}; enqueue(std::move(p));
 }
-
-void FusionEngine::feedImage(int64_t tNs, int64_t exposureNs, float iso,
-                             int width, int height, int yStride,
-                             const uint8_t* yPlane, size_t yLen) {
-    ImageMsg m;
-    m.t = tNs;
-    m.exposureNs = exposureNs;
-    m.iso = iso;
-    m.w = width;
-    m.h = height;
-    m.stride = yStride;
-    m.y.assign(yPlane, yPlane + yLen);
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        imgQ_.push_back(std::move(m));
-    }
-    cv_.notify_one();
+void FusionEngine::feedGnssSats(int64_t t,const int* types,const float* cn0,int n) {
+    if (n<0 || n>1024 || (n && (!types || !cn0))) { ++admissionDrops_; return; }
+    GnssSats s; s.t=t;
+    if (n) { s.constellations.assign(types,types+n); s.cn0.assign(cn0,cn0+n); }
+    Pending p; p.t=t; p.priority=30; p.apply=[this,s]{processSats(s);}; enqueue(std::move(p));
 }
-
-// ---------------------------------------------------------------------------
-// 坐标换算
-// ---------------------------------------------------------------------------
-void FusionEngine::wgs84ToEnu(double lat, double lon, double alt, Vec3& enu) const {
-    double phi = lat * M_PI / 180.0, lam = lon * M_PI / 180.0;
-    double N = kA / std::sqrt(1.0 - kE2 * std::sin(phi) * std::sin(phi));
-    Vec3 p;
-    p.x() = (N + alt) * std::cos(phi) * std::cos(lam);
-    p.y() = (N + alt) * std::cos(phi) * std::sin(lam);
-    p.z() = (N * (1.0 - kE2) + alt) * std::sin(phi);
-
-    Vec3 d = p - originEcef_;
-    enu.x() = -std::sin(lam) * d.x() + std::cos(lam) * d.y();
-    enu.y() = -std::sin(phi) * std::cos(lam) * d.x()
-              - std::sin(phi) * std::sin(lam) * d.y()
-              + std::cos(phi) * d.z();
-    enu.z() = std::cos(phi) * std::cos(lam) * d.x()
-              + std::cos(phi) * std::sin(lam) * d.y()
-              + std::sin(phi) * d.z();
+void FusionEngine::feedImage(int64_t t,int64_t exposure,float iso,int w,int h,int stride,const uint8_t* y,size_t len) {
+    if (!hasClockOffset_ || !y || w<1 || h<1 || w>16384 || h>16384 || stride<w || stride>1048576 ||
+        size_t(h-1)*size_t(stride)+size_t(w)>len || size_t(w)*h>32*1024*1024) { ++admissionDrops_; return; }
+    int64_t offset=clockOffsetNs_.load();
+    if (t<0 || (offset>0 && t>std::numeric_limits<int64_t>::max()-offset) || (offset<0 && t<-offset)) { ++admissionDrops_; return; }
+    if (imageQuota_->fetch_add(1)>=8) { imageQuota_->fetch_sub(1); ++admissionDrops_; return; }
+    std::shared_ptr<ImageMsg> frame;
+    try { frame=std::make_shared<ImageMsg>(); }
+    catch (...) { imageQuota_->fetch_sub(1); throw; }
+    frame->quota=imageQuota_; frame->t=t+offset; frame->exposureNs=exposure; frame->iso=iso; frame->w=w; frame->h=h;
+    grayFromY(y,w,h,stride,frame->gray);
+    Pending p; p.t=frame->t; p.priority=40; p.apply=[this,frame]{processImage(*frame);}; enqueue(std::move(p));
 }
-
-// ---------------------------------------------------------------------------
-// 融合线程
-// ---------------------------------------------------------------------------
+void FusionEngine::clearState() {
+    filter_.reset(); timeline_.clear(); magCal_=MagCalibrator{};
+    initDone_=initHasOrigin_=magBiasSet_=havePrev_=false;
+    initAccel_.clear(); initMag_.clear(); gpsPath_.clear();
+    prevGray_.clear(); prevKps_.clear(); prevIds_.clear(); magBias_.setZero();
+    originEcef_.setZero(); ecefToEnu_.setIdentity(); originLat_=originLon_=originAlt_=0.;
+    gpsSats_=0; gpsCn0Avg_=0.; frames_=prevTracks_=rejectedImages_=0;
+}
 void FusionEngine::loop() {
-    while (!stop_) {
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            if (resetPending_) {
-                resetPending_ = false;
-                initHasGps_ = false;
-                initHasOrigin_ = false;
-                initAccel_.clear();
-                initMag_.clear();
-                magBiasSet_ = false;
-                initDone_ = false;
-                gpsPath_.clear();
-                filter_.reset();
-                frames_ = 0;
-                prevTracks_ = 0;
-                havePrev_ = false;
-                prevKps_.clear();
-                prevIds_.clear();
-                prevGray_.clear();
-            }
-            cv_.wait_for(lk, std::chrono::milliseconds(20),
-                         [this]() {
-                             return !imuQ_.empty() || !magQ_.empty() || !gpsQ_.empty() ||
-                                    !satsQ_.empty() || !imgQ_.empty();
-                         });
-            if (stop_) break;
-
-            // 先 IMU(传播), 再其它
-            int dbgN = 0;
-            while (!imuQ_.empty()) {
-                ImuSample s = imuQ_.front();
-                imuQ_.pop_front();
-                if (dbgN++ % 25 == 0)
-                    fprintf(stderr, "[dbg] drain imu #%d t=%.6f accelS=%zu\n", dbgN,
-                            s.t * 1e-9, initAccel_.size());
-                processImu(s);
-                if (dbgN % 25 == 0)
-                    fprintf(stderr, "[dbg]   done imu #%d t=%.6f accelS=%zu\n", dbgN,
-                            s.t * 1e-9, initAccel_.size());
-            }
-            {
-                static int dbg = 0;
-                if (++dbg % 200 == 1)
-                    fprintf(stderr, "[fusion] imu=%zu mag=%zu gps=%zu sats=%zu img=%zu initDone=%d\n",
-                            imuQ_.size(), magQ_.size(), gpsQ_.size(), satsQ_.size(),
-                            imgQ_.size(), initDone_ ? 1 : 0);
-            }
-            while (!magQ_.empty()) {
-                MagSample s = magQ_.front();
-                magQ_.pop_front();
-                processMag(s);
-            }
-            while (!gpsQ_.empty()) {
-                GpsFix f = gpsQ_.front();
-                gpsQ_.pop_front();
-                processGps(f);
-            }
-            while (!satsQ_.empty()) {
-                GnssSats s = satsQ_.front();
-                satsQ_.pop_front();
-                processSats(s);
-            }
-            while (!imgQ_.empty()) {
-                ImageMsg m = std::move(imgQ_.front());
-                imgQ_.pop_front();
-                processImage(m);
-            }
-        }
-        buildSnapshot();
-    }
-}
-
-void FusionEngine::processImu(const ImuSample& s) {
-    fprintf(stderr, "[dbg] processImu enter t=%.6f initDone=%d\n", s.t * 1e-9,
-            initDone_ ? 1 : 0);
-    if (!initDone_) {
-        // 初始化前: 累积加速度用于重力方向
-        initAccel_.push_back(s.accel);
-        if (initAccel_.size() > 4000) initAccel_.erase(initAccel_.begin(),
-                                                       initAccel_.begin() + 2000);
-        filter_.feedImu(s);
-        maybeInit(s.t);
-        return;
-    }
-    filter_.feedImu(s);
-}
-
-void FusionEngine::processMag(const MagSample& s) {
-    if (!magBiasSet_ && !magCal_.isDone()) {
-        magBias_ = s.bias;  // 系统 UNCALIBRATED 估计的硬磁偏置
-        magBiasSet_ = true;
-    }
-    if (magCal_.isCollecting()) {
-        magCal_.addSample(s.value - s.bias, s.t);
-        if (magCal_.isDone()) {
-            magCal_.finish();
-            magBias_ = magCal_.bias();
-        }
-    }
-    if (initDone_ && magBiasSet_) {
-        MagSample c = s;
-        c.bias = magBias_;
-        filter_.feedMag(c);
-    } else if (!initDone_) {
-        initMag_.push_back(s.value - (magBiasSet_ ? magBias_ : Vec3::Zero()));
-        if (initMag_.size() > 200) initMag_.erase(initMag_.begin());
-        maybeInit(s.t);
-    }
-}
-
-void FusionEngine::processGps(const GpsFix& f) {
-    if (!initHasOrigin_) {
-        initHasGps_ = true;
-        initHasOrigin_ = true;
-        originLat_ = f.lat;
-        originLon_ = f.lon;
-        originAlt_ = f.alt;
-        double phi = originLat_ * M_PI / 180.0, lam = originLon_ * M_PI / 180.0;
-        double N = kA / std::sqrt(1.0 - kE2 * std::sin(phi) * std::sin(phi));
-        originEcef_.x() = (N + originAlt_) * std::cos(phi) * std::cos(lam);
-        originEcef_.y() = (N + originAlt_) * std::cos(phi) * std::sin(lam);
-        originEcef_.z() = (N * (1.0 - kE2) + originAlt_) * std::sin(phi);
-        maybeInit(f.t);
-        return;
-    }
-    if (!initDone_) {
-        maybeInit(f.t);
-        return;
-    }
-    Vec3 enu;
-    wgs84ToEnu(f.lat, f.lon, f.alt, enu);
-    gpsPath_.push_back(enu);
-    if (static_cast<int>(gpsPath_.size()) > kMaxGpsPath)
-            gpsPath_.erase(gpsPath_.begin(), gpsPath_.begin() + 100);
-    filter_.feedGpsPosition(f, enu);
-}
-
-void FusionEngine::processSats(const GnssSats& s) {
-    gpsSats_ = static_cast<int>(s.cn0.size());
-    double sum = 0;
-    for (float c : s.cn0) sum += c;
-    gpsCn0Avg_ = gpsSats_ > 0 ? sum / gpsSats_ : 0;
-}
-
-void FusionEngine::maybeInit(int64_t t) {
-    if (initDone_) return;
-    if (!initHasOrigin_ || initAccel_.size() < kInitAccelCount ||
-        initMag_.size() < kInitMagCount) {
-        return;
-    }
-    // 重力方向 -> roll/pitch
-    Vec3 a = Vec3::Zero();
-    for (auto& v : initAccel_) a += v;
-    a /= static_cast<double>(initAccel_.size());
-    a.normalize();
-    double pitch = std::atan2(-a.x(), std::sqrt(a.y() * a.y() + a.z() * a.z()));
-    double roll = std::atan2(a.y(), a.z());
-
-    // 磁力计 -> yaw (倾角补偿)
-    Vec3 m = Vec3::Zero();
-    for (auto& v : initMag_) m += v;
-    m /= static_cast<double>(initMag_.size());
-    double cp = std::cos(roll), sp = std::sin(roll);
-    double ct = std::cos(pitch), st = std::sin(pitch);
-    Vec3 mComp;
-    mComp.x() = m.x() * ct + m.y() * sp * st + m.z() * cp * st;
-    mComp.y() = m.y() * cp - m.z() * sp;
-    double declRad = cfg_.filter.magDeclinationDeg * M_PI / 180.0;
-    double yaw = std::atan2(mComp.x(), mComp.y()) - declRad;
-
-    // R_IG = R_z(-yaw)·R_y(pitch)·R_x(roll): quatYaw(q.conjugate()) = 航向
-    Quat q = (Eigen::AngleAxisd(-yaw, Vec3::UnitZ()) *
-              Eigen::AngleAxisd(pitch, Vec3::UnitY()) *
-              Eigen::AngleAxisd(roll, Vec3::UnitX()))
-                 .normalized();
-
-    filter_.initialize(Vec3::Zero(), q, t);
-    initDone_ = true;
-    initT0_ = t;
-    std::fprintf(stderr, "[dbg] maybeInit fired t=%g yaw=%g accelS=%zu magS=%zu\n", t * 1e-9,
-                 yaw * 180.0 / M_PI, initAccel_.size(), initMag_.size());
-}
-
-// ---------------------------------------------------------------------------
-// 图像处理(视觉跟踪)
-// ---------------------------------------------------------------------------
-void FusionEngine::processImage(ImageMsg& m) {
-    if (!initDone_) {
-        // 初始化前也保留第一帧灰度, 避免首帧全新
-        grayFromY(m.y.data(), m.w, m.h, m.stride, prevGray_);
-        havePrev_ = false;
-        return;
-    }
-    if (!hasClockOffset_.load()) {
-        // 时钟偏移未就绪: 无法对齐相机时间戳, 跳过
-        return;
-    }
-    int64_t tMono = m.t + static_cast<int64_t>(clockOffsetNs_);
-
-    std::vector<uint8_t> gray;
-    grayFromY(m.y.data(), m.w, m.h, m.stride, gray);
-
-    auto& f = cfg_.filter;
-    std::vector<Keypoint> detected;
-    detectFast(gray.data(), m.w, m.h, f.fastThreshold, detected, f.maxFeatures,
-               f.maxCellsX, f.maxCellsY, f.maxPerCell);
-
-    std::vector<std::pair<uint32_t, Vec2>> matched;
-    std::vector<std::pair<uint32_t, Vec2>> fresh;
-
-    if (havePrev_ && !prevKps_.empty()) {
-        std::vector<Keypoint> curKps;
-        std::vector<uint8_t> status;
-        trackKlt(prevGray_, gray, m.w, m.h, prevKps_, curKps, status);
-
-        std::vector<Keypoint> curTracked;
-        std::vector<uint32_t> curIds;
-        for (size_t i = 0; i < prevIds_.size(); ++i) {
-            if (status[i]) {
-                matched.push_back({prevIds_[i], Vec2(curKps[i].x, curKps[i].y)});
-                curTracked.push_back(curKps[i]);
-                curIds.push_back(prevIds_[i]);
-            }
-        }
-
-        // 新检测: 与已跟踪点距离足够远
-        size_t budget = f.maxFeatures > filter_.trackCount()
-                            ? f.maxFeatures - filter_.trackCount()
-                            : 0;
-        for (auto& kp : detected) {
-            if (budget == 0) break;
-            bool near = false;
-            for (auto& tk : curTracked) {
-                float dx = kp.x - tk.x, dy = kp.y - tk.y;
-                if (dx * dx + dy * dy < 18.0f * 18.0f) {
-                    near = true;
-                    break;
+    while (true) {
+        std::deque<Pending> batch; std::deque<Command> commands; bool final;
+        { std::unique_lock<std::mutex> lk(mtx_);
+          cv_.wait(lk,[this]{return stop_ || !pending_.empty() || !commands_.empty();});
+          final=stop_; batch.swap(pending_); commands.swap(commands_); }
+        try {
+            for (Command c:commands) {
+                if (c==Command::MagCal) magCal_.start();
+                else {
+                    clearState(); batch.clear(); error_.clear();
+                    if (c==Command::Pause) paused_=true;
+                    if (c==Command::Resume) paused_=false;
                 }
             }
-            if (!near) {
-                uint32_t id = filter_.allocateTrackId();
-                fresh.push_back({id, Vec2(kp.x, kp.y)});
-                curTracked.push_back(kp);
-                curIds.push_back(id);
-                budget--;
-            }
+            if (!paused_) {
+                for (auto& p:batch) {
+                    if (p.imu) timeline_.pushImu(p.sample);
+                    else timeline_.pushObservation(p.t,p.priority,std::move(p.apply));
+                }
+                timeline_.drain([this](const ImuSample& s){processImu(s);},final);
+            } else admissionDrops_+=batch.size();
+        } catch (const std::exception& e) {
+            error_=e.what(); paused_=true; timeline_.clear();
         }
-        prevKps_ = curTracked;
-        prevIds_ = curIds;
-    } else {
-        for (auto& kp : detected) {
-            uint32_t id = filter_.allocateTrackId();
-            fresh.push_back({id, Vec2(kp.x, kp.y)});
-        }
-        prevKps_ = detected;
-        for (auto& fr : fresh) prevIds_.push_back(fr.first);
+        buildSnapshot();
+        if (final) break;
     }
-
-    if (havePrev_ || fresh.size() > 10) {
-        filter_.feedImage(tMono, matched, fresh);
-    }
-    prevGray_ = std::move(gray);
-    havePrev_ = true;
-    frames_++;
-    prevTracks_ = matched.size();
+    running_=false;
 }
-
-// ---------------------------------------------------------------------------
-// 快照
-// ---------------------------------------------------------------------------
+void FusionEngine::processImu(const ImuSample& s) {
+    if (!initDone_) {
+        initAccel_.push_back(s.accel); if (initAccel_.size()>80) initAccel_.pop_front();
+        filter_.feedImu(s); maybeInit(s.t);
+    } else filter_.feedImu(s);
+}
+void FusionEngine::processMag(const MagSample& s) {
+    if (!s.value.allFinite() || !s.bias.allFinite()) return;
+    if (magCal_.isCollecting()) {
+        magCal_.addSample(s.value,s.t); // fit RAW samples: the fitted bias is absolute
+        if (magCal_.isDone()) { magCal_.finish(); magBias_=magCal_.bias(); magBiasSet_=magBias_.allFinite(); }
+    }
+    Vec3 bias=magBiasSet_?magBias_:s.bias;
+    if (!initDone_) {
+        initMag_.push_back(s.value-bias); if (initMag_.size()>20) initMag_.pop_front(); maybeInit(s.t);
+    } else { MagSample corrected=s; corrected.bias=bias; filter_.feedMag(corrected); }
+}
+void FusionEngine::processGps(const GpsFix& f) {
+    if (!cfg_.filter.gpsEnabled) return;
+    if (!initHasOrigin_) {
+        originLat_=f.lat; originLon_=f.lon; originAlt_=f.alt; originEcef_=ecef(f.lat,f.lon,f.alt);
+        double p=f.lat*kPi/180.,l=f.lon*kPi/180.;
+        ecefToEnu_ << -std::sin(l),std::cos(l),0.,
+            -std::sin(p)*std::cos(l),-std::sin(p)*std::sin(l),std::cos(p),
+            std::cos(p)*std::cos(l),std::cos(p)*std::sin(l),std::sin(p);
+        initHasOrigin_=true; maybeInit(f.t);
+    }
+    if (!initDone_) return;
+    Vec3 enu=ecefToEnu_*(ecef(f.lat,f.lon,f.alt)-originEcef_);
+    gpsPath_.push_back(enu); if (gpsPath_.size()>800) gpsPath_.erase(gpsPath_.begin(),gpsPath_.begin()+100);
+    filter_.feedGpsPosition(f,enu);
+}
+void FusionEngine::processSats(const GnssSats& s) {
+    gpsSats_=int(s.cn0.size()); double sum=0;
+    for (float x:s.cn0) if (std::isfinite(x)) sum+=x;
+    gpsCn0Avg_=gpsSats_?sum/gpsSats_:0.;
+}
+void FusionEngine::maybeInit(int64_t t) {
+    if (initDone_ || initAccel_.size()<80 || (cfg_.filter.gpsEnabled && !initHasOrigin_) ||
+        (cfg_.filter.magEnabled && initMag_.size()<3)) return;
+    Vec3 a=Vec3::Zero(); for (const auto& x:initAccel_) a+=x;
+    if (a.norm()<1e-8) return; Vec3 z=a.normalized();
+    Quat q=Quat::FromTwoVectors(Vec3::UnitZ(),z);
+    if (cfg_.filter.magEnabled) {
+        Vec3 m=Vec3::Zero(); for (const auto& x:initMag_) m+=x;
+        Vec3 y=m-z*z.dot(m); if (y.norm()<1e-8) return; y.normalize(); Vec3 x=y.cross(z);
+        Mat3 R; R.col(0)=x; R.col(1)=y; R.col(2)=z;
+        q=Quat(R)*Quat(Eigen::AngleAxisd(cfg_.filter.magDeclinationDeg*kPi/180.,Vec3::UnitZ()));
+    }
+    filter_.initialize(Vec3::Zero(),q,t); initDone_=true;
+}
+void FusionEngine::processImage(const ImageMsg& frame) {
+    if (!initDone_ || frame.t!=filter_.imuTime() || frame.t<=filter_.lastImageTime() ||
+        frame.w!=cfg_.filter.cam.width || frame.h!=cfg_.filter.cam.height) { ++rejectedImages_; return; }
+    std::vector<Keypoint> live; std::vector<uint32_t> ids;
+    std::vector<std::pair<uint32_t,Vec2>> matched,fresh;
+    if (havePrev_ && !prevKps_.empty()) {
+        std::vector<Keypoint> current; std::vector<uint8_t> status;
+        trackKlt(prevGray_,frame.gray,frame.w,frame.h,prevKps_,current,status);
+        for (size_t i=0;i<prevIds_.size();++i) if (status[i]) {
+            live.push_back(current[i]); ids.push_back(prevIds_[i]);
+            matched.push_back({prevIds_[i],Vec2(current[i].x,current[i].y)});
+        }
+    }
+    const auto& c=cfg_.filter;
+    if (live.size()<size_t(c.maxFeatures)) {
+        std::vector<Keypoint> detected;
+        detectFast(frame.gray.data(),frame.w,frame.h,c.fastThreshold,detected,c.maxFeatures,c.maxCellsX,c.maxCellsY,c.maxPerCell);
+        for (const auto& kp:detected) {
+            if (live.size()>=size_t(c.maxFeatures)) break;
+            bool near=false;
+            for (const auto& p:live) if (std::hypot(kp.x-p.x,kp.y-p.y)<18.f) { near=true; break; }
+            if (near) continue;
+            uint32_t id=filter_.allocateTrackId(); ids.push_back(id); live.push_back(kp); fresh.push_back({id,Vec2(kp.x,kp.y)});
+        }
+    }
+    if (filter_.feedImage(frame.t,matched,fresh)!=ImageResult::Accepted) { ++rejectedImages_; return; }
+    prevKps_=std::move(live); prevIds_=std::move(ids); prevGray_=frame.gray;
+    havePrev_=true; ++frames_; prevTracks_=matched.size();
+}
 void FusionEngine::buildSnapshot() {
     Json j;
-    double tNow = 0;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (!initDone_) {
-            j["mode"] = "init";
-            j["gpsSats"] = gpsSats_;
-            j["accelSamples"] = static_cast<int>(initAccel_.size());
-            j["magSamples"] = static_cast<int>(initMag_.size());
-            j["hasOrigin"] = initHasOrigin_;
-            snap_ = j;
-            return;
-        }
-    }
-    j["mode"] = "running";
-    j["t"] = filter_.imuTime();
-    Quat q = filter_.imuQuat();
-    Vec3 p = filter_.imuPos();
-    Vec3 v = filter_.imuVel();
-    j["pose"] = {
-        {"qx", q.x()}, {"qy", q.y()}, {"qz", q.z()}, {"qw", q.w()},
-        {"x", p.x()}, {"y", p.y()}, {"z", p.z()},
-        {"vx", v.x()}, {"vy", v.y()}, {"vz", v.z()},
-        {"yawDeg", quatYaw(q.conjugate()) * 180.0 / M_PI},
-        {"pitchDeg", std::asin(std::max(-1.0, std::min(1.0, 2.0 * (q.w() * q.y() - q.z() * q.x())))) * 180.0 / M_PI},
-        {"rollDeg", std::atan2(2.0 * (q.w() * q.x() + q.y() * q.z()),
-                               1.0 - 2.0 * (q.x() * q.x() + q.y() * q.y())) * 180.0 / M_PI}
-    };
-    j["window"] = static_cast<int>(filter_.cameraCount());
-    j["tracks"] = static_cast<int>(filter_.trackCount());
-    j["tracked"] = prevTracks_;
-
-    {
-        nlohmann::json arr = nlohmann::json::array();
-        for (auto& pt : filter_.recentPoints()) {
-            arr.push_back({pt.x(), pt.y(), pt.z()});
-        }
-        j["features"] = arr;
-    }
-    {
-        nlohmann::json arr = nlohmann::json::array();
-        std::lock_guard<std::mutex> lk(mtx_);
-        for (auto& pt : gpsPath_) arr.push_back({pt.x(), pt.y(), pt.z()});
-        j["gpsPath"] = arr;
-        j["gpsSats"] = gpsSats_;
-        j["gpsCn0"] = gpsCn0Avg_;
-    }
-    j["origin"] = {{"lat", originLat_}, {"lon", originLon_}, {"alt", originAlt_}};
-    j["mag"] = {
-        {"state", magCal_.isCollecting() ? "collecting"
-                 : magCal_.isDone() ? "done" : "idle"},
-        {"samples", magCal_.collected()},
-        {"bias", {magBias_.x(), magBias_.y(), magBias_.z()}},
-        {"radius", magCal_.radius()}
-    };
-    j["stats"] = {
-        {"imuHz", filter_.imuRate()},
-        {"imgHz", filter_.imgRate()},
-        {"gpsHz", filter_.gpsRate()},
-        {"updates", filter_.updateCount()},
-        {"frames", filter_.imgCount()},
-        {"updateUs", filter_.lastUpdateDurationUs()},
-        {"clockOffsetNs", clockOffsetNs_},
-        {"clockReady", hasClockOffset_.load()}
-    };
-    j["calib"] = {
-        {"bg", {filter_.imuBiasG().x(), filter_.imuBiasG().y(), filter_.imuBiasG().z()}},
-        {"ba", {filter_.imuBiasA().x(), filter_.imuBiasA().y(), filter_.imuBiasA().z()}},
-        {"declDeg", cfg_.filter.magDeclinationDeg}
-    };
-    std::lock_guard<std::mutex> lk(snapMtx_);
-    snap_ = j;
+    j["mode"]=paused_?"paused":initDone_?"running":"init";
+    j["error"]=error_; j["t"]=filter_.imuTime();
+    j["gpsSats"]=gpsSats_; j["gpsCn0"]=gpsCn0Avg_;
+    j["accelSamples"]=initAccel_.size(); j["magSamples"]=initMag_.size(); j["hasOrigin"]=initHasOrigin_;
+    Quat q=filter_.imuQuat(); Vec3 p=filter_.imuPos(),v=filter_.imuVel(); Quat bodyToGlobal=q.conjugate();
+    j["pose"]={{"qx",q.x()},{"qy",q.y()},{"qz",q.z()},{"qw",q.w()},
+        {"x",p.x()},{"y",p.y()},{"z",p.z()},{"vx",v.x()},{"vy",v.y()},{"vz",v.z()},
+        {"yawDeg",quatYaw(bodyToGlobal)*180./kPi},
+        {"pitchDeg",std::asin(std::clamp(2.*(bodyToGlobal.w()*bodyToGlobal.y()-bodyToGlobal.z()*bodyToGlobal.x()),-1.,1.))*180./kPi},
+        {"rollDeg",std::atan2(2.*(bodyToGlobal.w()*bodyToGlobal.x()+bodyToGlobal.y()*bodyToGlobal.z()),1.-2.*(bodyToGlobal.x()*bodyToGlobal.x()+bodyToGlobal.y()*bodyToGlobal.y()))*180./kPi}};
+    j["window"]=filter_.cameraCount(); j["tracks"]=filter_.trackCount(); j["tracked"]=prevTracks_;
+    j["features"]=Json::array(); for (const auto& x:filter_.recentPoints()) j["features"].push_back({x.x(),x.y(),x.z()});
+    j["gpsPath"]=Json::array(); for (const auto& x:gpsPath_) j["gpsPath"].push_back({x.x(),x.y(),x.z()});
+    j["origin"]={{"lat",originLat_},{"lon",originLon_},{"alt",originAlt_}};
+    j["mag"]={{"state",magCal_.isCollecting()?"collecting":magCal_.isDone()?"done":"idle"},
+        {"samples",magCal_.collected()},{"bias",{magBias_.x(),magBias_.y(),magBias_.z()}},{"radius",magCal_.radius()}};
+    j["stats"]={{"imuHz",filter_.imuRate()},{"imgHz",filter_.imgRate()},{"gpsHz",filter_.gpsRate()},
+        {"updates",filter_.updateCount()},{"visualUpdates",filter_.visualUpdateCount()},
+        {"frames",frames_},{"updateUs",filter_.lastUpdateDurationUs()},
+        {"clockOffsetNs",clockOffsetNs_.load()},{"clockReady",hasClockOffset_.load()},
+        {"late",timeline_.late},{"overflow",timeline_.overflow},{"invalid",timeline_.invalid},
+        {"unbracketed",timeline_.unbracketed},{"admissionDrops",admissionDrops_.load()},
+        {"rejectedImages",rejectedImages_},{"queued",timeline_.queued()}};
+    Vec3 bg=filter_.imuBiasG(),ba=filter_.imuBiasA();
+    j["calib"]={{"bg",{bg.x(),bg.y(),bg.z()}},{"ba",{ba.x(),ba.y(),ba.z()}},{"declDeg",cfg_.filter.magDeclinationDeg}};
+    std::lock_guard<std::mutex> lk(snapMtx_); snap_=std::move(j);
 }
-
 std::string FusionEngine::statusJson() {
     std::lock_guard<std::mutex> lk(snapMtx_);
-    if (snap_.is_null()) {
-        Json j;
-        j["mode"] = "idle";
-        return j.dump();
-    }
-    return snap_.dump();
+    return snap_.is_null()?std::string("{\"mode\":\"idle\"}"):snap_.dump();
 }
-
-}  // namespace gvio
+} // namespace gvio
