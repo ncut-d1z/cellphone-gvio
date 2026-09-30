@@ -12,6 +12,10 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        tls: [system, mbedtls-3.6.4]
     env:
       CC: clang
       CXX: clang++
@@ -27,6 +31,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang ninja-build libeigen3-dev nlohmann-json3-dev libmbedtls-dev libnghttp2-dev
           python -m pip install 'httpx[http2]==0.28.1'
+      - name: Mbed TLS 3.6 compatibility build
+        if: matrix.tls == 'mbedtls-3.6.4'
+        run: |
+          git clone --depth 1 --branch mbedtls-3.6.4 --recurse-submodules --shallow-submodules https://github.com/Mbed-TLS/mbedtls.git "$RUNNER_TEMP/mbedtls-src"
+          cmake -S "$RUNNER_TEMP/mbedtls-src" -B "$RUNNER_TEMP/mbedtls-build" -G Ninja -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/mbedtls-install"
+          cmake --build "$RUNNER_TEMP/mbedtls-build" --target install --parallel 2
+          echo "CMAKE_PREFIX_PATH=$RUNNER_TEMP/mbedtls-install" >> "$GITHUB_ENV"
       - name: Private-key guard and its regression tests
         run: |
           python tools/check_no_private_keys.py

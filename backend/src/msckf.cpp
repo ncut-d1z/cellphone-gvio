@@ -167,12 +167,12 @@ void MsckfFilter::attachObs(const std::vector<std::pair<uint32_t,Vec2>>& matched
                             const std::vector<std::pair<uint32_t,Vec2>>& fresh) {
     int ci=int(cams_.size())-1;
     for (auto& kv:tracks_) kv.second.lost=true;
-    auto add=[&](const auto& values) {
+    auto add=[&](const auto& values,bool allowNew) {
         for (const auto& ob:values) {
             if (!ob.second.allFinite()) continue;
             auto it=tracks_.find(ob.first);
             if (it==tracks_.end()) {
-                if (tracks_.size()>=size_t(cfg_.maxFeatures)) continue;
+                if (!allowNew || tracks_.size()>=size_t(cfg_.maxFeatures)) continue;
                 it=tracks_.emplace(ob.first,FeatureTrack{}).first;
                 it->second.id=ob.first;
             }
@@ -181,7 +181,11 @@ void MsckfFilter::attachObs(const std::vector<std::pair<uint32_t,Vec2>>& matched
             ft.uv=ob.second; ft.obs.push_back({ci,ob.second}); ft.lost=false;
         }
     };
-    add(matched); add(fresh);
+    // Mark surviving existing tracks first; free lost slots before replenishment.
+    // Otherwise a full previous frame suppresses all replacements for one frame.
+    add(matched,false);
+    finalizeLost();
+    add(matched,true); add(fresh,true);
 }
 void MsckfFilter::finalizeLost() {
     std::vector<uint32_t> ids;
@@ -329,7 +333,7 @@ ImageResult MsckfFilter::feedImage(int64_t t,const std::vector<std::pair<uint32_
     if (t!=imu_.t) return ImageResult::NotAtImuTime;
     if (lastImgT_>0) imgRate_=1e9/double(t-lastImgT_);
     lastImgT_=t; ++imgCount_;
-    augment(); attachObs(matched,fresh); finalizeLost(); prune(); nanGuard("image");
+    augment(); attachObs(matched,fresh); prune(); nanGuard("image");
     return ImageResult::Accepted;
 }
 } // namespace gvio
