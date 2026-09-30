@@ -1,0 +1,11 @@
+name: Private key guard
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  private-keys:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject private keys in tracked contents
+        run: python3 tools/check_no_private_keys.py
